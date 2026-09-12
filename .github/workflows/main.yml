@@ -40,19 +40,13 @@ jobs:
             echo "project=$PROJECT" >> "$GITHUB_OUTPUT"
             LIST_ARGS="-project $PROJECT"
           else
-            echo "::error::No .xcodeproj or .xcworkspace found after checkout/xcodegen. Repo layout may differ from expected." 
+            echo "::error::No .xcodeproj or .xcworkspace found after checkout/xcodegen. Repo layout may differ from expected."
             find . -maxdepth 2 -iname "*.xcodeproj" -o -iname "*.xcworkspace" -o -iname "project.yml"
             exit 1
           fi
 
-          SCHEME=$(xcodebuild -list $LIST_ARGS -json | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-key = 'workspace' if 'workspace' in d else 'project'
-schemes = d[key]['schemes']
-print(schemes[0] if schemes else '')
-")
-          if [ -z "$SCHEME" ]; then
+          SCHEME=$(xcodebuild -list $LIST_ARGS -json | jq -r 'if has("workspace") then .workspace.schemes[0] else .project.schemes[0] end')
+          if [ -z "$SCHEME" ] || [ "$SCHEME" = "null" ]; then
             echo "::error::No scheme found via xcodebuild -list"
             exit 1
           fi
