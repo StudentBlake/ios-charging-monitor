@@ -8,87 +8,88 @@ on:
 jobs:
   build:
     runs-on: macos-latest
+    env:
+      CONFIG: Release
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Select Xcode version
-        run: |
-          sudo xcode-select -p
-          xcodebuild -version
+      - name: Show Xcode version
+        run: xcodebuild -version
 
-      - name: Discover project/scheme
+      - name: Install XcodeGen (if project.yml present)
+        run: |
+          if [ -f project.yml ]; then
+            brew install xcodegen
+            xcodegen generate
+          else
+            echo "No project.yml found, skipping xcodegen"
+          fi
+
+      - name: Discover project/workspace/scheme
         id: discover
         run: |
           set -e
           if ls *.xcworkspace >/dev/null 2>&1; then
             WORKSPACE=$(ls -d *.xcworkspace | head -n1)
             echo "workspace=$WORKSPACE" >> "$GITHUB_OUTPUT"
-            SCHEME=$(xcodebuild -list -workspace "$WORKSPACE" -json | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['workspace']['schemes'][0])")
-          else
+            LIST_ARGS="-workspace $WORKSPACE"
+          elif ls *.xcodeproj >/dev/null 2>&1; then
             PROJECT=$(ls -d *.xcodeproj | head -n1)
             echo "project=$PROJECT" >> "$GITHUB_OUTPUT"
-            SCHEME=$(xcodebuild -list -project "$PROJECT" -json | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['project']['schemes'][0])")
+            LIST_ARGS="-project $PROJECT"
+          else
+            echo "::error::No .xcodeproj or .xcworkspace found after checkout/xcodegen. Repo layout may differ from expected." 
+            find . -maxdepth 2 -iname "*.xcodeproj" -o -iname "*.xcworkspace" -o -iname "project.yml"
+            exit 1
+          fi
+
+          SCHEME=$(xcodebuild -list $LIST_ARGS -json | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+key = 'workspace' if 'workspace' in d else 'project'
+schemes = d[key]['schemes']
+print(schemes[0] if schemes else '')
+")
+          if [ -z "$SCHEME" ]; then
+            echo "::error::No scheme found via xcodebuild -list"
+            exit 1
           fi
           echo "scheme=$SCHEME" >> "$GITHUB_OUTPUT"
-          echo "Discovered scheme: $SCHEME"
+          echo "Discovered: $LIST_ARGS, scheme=$SCHEME"
 
-      - name: Build unsigned .app for iOS device
+      - name: Build unsigned .app
         run: |
           set -e
-          mkdir -p build
+          BUILD_DIR="$(mktemp -d)"
+          echo "BUILD_DIR=$BUILD_DIR" >> "$GITHUB_ENV"
 
           if [ -n "${{ steps.discover.outputs.workspace }}" ]; then
-            xcodebuild -workspace "${{ steps.discover.outputs.workspace }}" \
-              -scheme "${{ steps.discover.outputs.scheme }}" \
-              -configuration Release \
-              -sdk iphoneos \
-              -destination "generic/platform=iOS" \
-              -derivedDataPath build/DerivedData \
-              CODE_SIGNING_ALLOWED=NO \
-              CODE_SIGNING_REQUIRED=NO \
-              CODE_SIGN_IDENTITY="" \
-              CODE_SIGN_ENTITLEMENTS="" \
-              AD_HOC_CODE_SIGNING_ALLOWED=YES \
-              clean build
+            PROJ_ARGS="-workspace ${{ steps.discover.outputs.workspace }}"
           else
-            xcodebuild -project "${{ steps.discover.outputs.project }}" \
-              -scheme "${{ steps.discover.outputs.scheme }}" \
-              -configuration Release \
-              -sdk iphoneos \
-              -destination "generic/platform=iOS" \
-              -derivedDataPath build/DerivedData \
-              CODE_SIGNING_ALLOWED=NO \
-              CODE_SIGNING_REQUIRED=NO \
-              CODE_SIGN_IDENTITY="" \
-              CODE_SIGN_ENTITLEMENTS="" \
-              AD_HOC_CODE_SIGNING_ALLOWED=YES \
-              clean build
+            PROJ_ARGS="-project ${{ steps.discover.outputs.project }}"
           fi
 
-      - name: Locate built .app
-        id: locate
-        run: |
-          set -e
-          APP_PATH=$(find build/DerivedData -type d -name "*.app" -path "*Release-iphoneos*" | head -n1)
-          if [ -z "$APP_PATH" ]; then
-            APP_PATH=$(find build/DerivedData -type d -name "*.app" | head -n1)
-          fi
-          echo "App path: $APP_PATH"
-          echo "app_path=$APP_PATH" >> "$GITHUB_OUTPUT"
-          echo "app_name=$(basename "$APP_PATH" .app)" >> "$GITHUB_OUTPUT"
+          xcodebuild $PROJ_ARGS \
+            -scheme "${{ steps.discover.outputs.scheme }}" \
+            -sdk iphoneos -configuration "$CONFIG" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            -derivedDataPath "$BUILD_DIR" build
 
       - name: Package into unsigned IPA
         run: |
           set -e
-          APP_PATH="${{ steps.locate.outputs.app_path }}"
-          APP_NAME="${{ steps.locate.outputs.app_name }}"
-          mkdir -p Payload
-          cp -R "$APP_PATH" "Payload/"
-          zip -r -y -q "${APP_NAME}-unsigned.ipa" Payload
-          mkdir -p output
-          mv "${APP_NAME}-unsigned.ipa" output/
+          APP=$(find "$BUILD_DIR/Build/Products/$CONFIG-iphoneos" -maxdepth 1 -name "*.app" | head -n1)
+          [ -d "$APP" ] || { echo "::error::no .app found under $BUILD_DIR/Build/Products/$CONFIG-iphoneos"; exit 1; }
+
+          APP_NAME=$(basename "$APP" .app)
+          STAGE="$BUILD_DIR/stage"
+          mkdir -p "$STAGE/Payload" output
+          cp -R "$APP" "$STAGE/Payload/"
+          ( cd "$STAGE" && zip -qry "$GITHUB_WORKSPACE/output/${APP_NAME}-unsigned.ipa" Payload )
+          echo "Built: output/${APP_NAME}-unsigned.ipa"
+          ls -lh output/
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
